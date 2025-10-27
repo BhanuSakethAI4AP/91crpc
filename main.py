@@ -21,6 +21,9 @@ from routes.v1 import service_master_routes
 from routes.v1 import operators_list_routes
 from routes.v1 import operator_service_list_routes
 from routes.v1 import approval_flow_master_routes
+from routes.v1 import approval_chain_routes
+from routes.v1 import crpc_request_pipelines_routes
+from routes.v1 import crpc_requests_routes
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -71,6 +74,10 @@ app.include_router(service_master_routes.router)
 app.include_router(operators_list_routes.router)
 app.include_router(operator_service_list_routes.router)
 app.include_router(approval_flow_master_routes.router)
+app.include_router(crpc_requests_routes.router)
+app.include_router(crpc_request_pipelines_routes.router)
+app.include_router(approval_chain_routes.router)
+
 
 # Root endpoint
 @app.get("/", tags=["Root"])

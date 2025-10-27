@@ -1,3 +1,4 @@
+#path: backend/services/service_master_service.py
 """
 Purpose: Business logic for Service Master operations.
 Handles CRUD operations, search, filtering, and sorting with comprehensive error handling.

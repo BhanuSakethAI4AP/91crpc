@@ -48,25 +48,26 @@ class DataReceivedStatus(str, Enum):
 
 # ========== Approval Chain ==========
 class ApprovalRole(str, Enum):
-    """Roles in the approval workflow hierarchy."""
+    """Roles in the approval workflow."""
     IO = "IO"
     SHO = "SHO"
     CI = "CI"
     DSP = "DSP"
     ADMIN_ASP = "Admin ASP"
-    SP = "SP"
+    IT_CORE = "IT Core"
 
 
 class ApprovalChainStatus(str, Enum):
     """Status values for approval chain tracking."""
-    APPROVED_BY_SHO = "ApprovedbySHO"
-    APPROVED_BY_CI = "ApprovedbyCI"
-    APPROVED_BY_DSP = "ApprovedbyDSP"
-    APPROVED_BY_ASP = "ApprovedbyASP"
-    ACK_BY_IT_CORE = "AckByITCore"
-    REJECT = "Reject"
-    FLAGGED_AS_VIP = "FlagedAsVIP"
-    APPROVED = "Approved"  # Added from your data model
+    PENDING = "Pending"                      # Waiting for approval
+    APPROVED_BY_SHO = "ApprovedbySHO"       # SHO approved
+    APPROVED_BY_CI = "ApprovedbyCI"         # CI approved
+    APPROVED_BY_DSP = "ApprovedbyDSP"       # DSP approved
+    APPROVED_BY_ASP = "ApprovedbyASP"       # ASP approved
+    ACK_BY_IT_CORE = "AckByITCore"          # IT Core acknowledged
+    REJECT = "Reject"                        # Rejected
+    FLAGGED_AS_VIP = "FlagedAsVIP"          # VIP flag raised
+    APPROVED = "Approved"                    # Final approval
 
 
 # ========== Dispatch & Communication ==========
