@@ -1,9 +1,12 @@
+#path: backend/services/approval_flow_master_service.py
 """
 Purpose: Business logic for Approval Flow Master operations.
 Handles CRUD operations for approval workflow definitions.
 
 Based on TFS: ApprovalFlowMaster.CREATE, READ, UPDATE, DELETE
 Error Codes: ERR.APPROVAL_FLOW.*
+
+Updated to support Universal Workflow with dynamic entry points.
 """
 
 from __future__ import annotations
@@ -50,6 +53,24 @@ class InvalidStepsError(ApprovalFlowMasterError):
         )
 
 
+class InvalidRoleMappingError(ApprovalFlowMasterError):
+    """Raised when role to step mapping validation fails."""
+    def __init__(self, details: str):
+        super().__init__(
+            f"Invalid role to step mapping: {details}",
+            "ERR.APPROVAL_FLOW.INVALID_ROLE_MAPPING"
+        )
+
+
+class DuplicateWorkflowError(ApprovalFlowMasterError):
+    """Raised when attempting to create duplicate universal workflow."""
+    def __init__(self):
+        super().__init__(
+            "A UNIVERSAL workflow already exists. Only one universal workflow is allowed.",
+            "ERR.APPROVAL_FLOW.DUPLICATE_UNIVERSAL"
+        )
+
+
 class DatabaseOperationError(ApprovalFlowMasterError):
     """Raised when database operation fails."""
     def __init__(self, operation: str, details: str):
@@ -64,6 +85,7 @@ class ApprovalFlowMasterService:
     """
     Service class for Approval Flow Master operations.
     Implements TFS functions: CREATE, READ, UPDATE, DELETE
+    Supports Universal Workflow with dynamic entry points.
     """
     
     def __init__(self):
@@ -73,6 +95,36 @@ class ApprovalFlowMasterService:
         except Exception as e:
             # ERROR: Database collection initialization failed
             raise DatabaseOperationError("INIT", str(e))
+    
+    # ========== VALIDATION HELPER ==========
+    def _validate_role_mapping(self, steps: List[dict], role_mapping: dict) -> None:
+        """
+        Validate that all roles in roleToStepMapping exist in steps.
+        
+        Args:
+            steps: List of step dictionaries
+            role_mapping: Role to step mapping dictionary
+            
+        Raises:
+            InvalidRoleMappingError: If validation fails
+        """
+        # Extract roles from steps
+        step_roles = {step["role"] for step in steps}
+        
+        # Check if all mapped roles exist in steps
+        for role in role_mapping.keys():
+            if role not in step_roles:
+                raise InvalidRoleMappingError(
+                    f"Role '{role}' in roleToStepMapping does not exist in steps"
+                )
+        
+        # Check if all mapped step numbers are valid
+        max_step = len(steps)
+        for role, step_num in role_mapping.items():
+            if step_num < 1 or step_num > max_step:
+                raise InvalidRoleMappingError(
+                    f"Invalid step number {step_num} for role '{role}'. Must be between 1 and {max_step}"
+                )
     
     # ========== CREATE Operation (TFS: ApprovalFlowMaster.CREATE) ==========
     def create_approval_flow(
@@ -89,12 +141,9 @@ class ApprovalFlowMasterService:
             - ERR.APPROVAL_FLOW.EMPTY_STEPS
             - ERR.APPROVAL_FLOW.INVALID_ROLE
             - ERR.APPROVAL_FLOW.INVALID_ORDER
+            - ERR.APPROVAL_FLOW.INVALID_ROLE_MAPPING
+            - ERR.APPROVAL_FLOW.DUPLICATE_UNIVERSAL
             - ERR.APPROVAL_FLOW.CREATE.DB_ERROR
-        
-        Preconditions:
-            - Steps array must not be empty (validated by Pydantic)
-            - Each role must exist in Enum(ApprovalRoles) (validated by Pydantic)
-            - Orders must be unique and sequential (validated by Pydantic)
         
         Args:
             data: Approval flow creation data
@@ -105,15 +154,21 @@ class ApprovalFlowMasterService:
             dict: Created approval flow document
             
         Raises:
-            InvalidStepsError: If steps validation fails
+            DuplicateWorkflowError: If UNIVERSAL workflow already exists
+            InvalidRoleMappingError: If role mapping validation fails
             DatabaseOperationError: If database operation fails
         """
         try:
-            # ========== VALIDATION: Steps validated by Pydantic ==========
-            # Pydantic validator ensures:
-            # - Steps array not empty
-            # - Roles exist in ApprovalRoles enum
-            # - Orders are unique and sequential
+            # ========== VALIDATION: Check for existing UNIVERSAL workflow ==========
+            if data.workflowType == "UNIVERSAL":
+                existing_universal = self.collection.find_one({
+                    "workflowType": "UNIVERSAL",
+                    "isDeleted": False
+                })
+                
+                if existing_universal:
+                    # ERROR: UNIVERSAL workflow already exists
+                    raise DuplicateWorkflowError()
             
             # ========== PREPARE DOCUMENT ==========
             now = datetime.now(timezone.utc)
@@ -125,10 +180,14 @@ class ApprovalFlowMasterService:
             flow_dict["steps"] = [
                 {
                     "role": step.role.value,
-                    "order": step.order
+                    "order": step.order,
+                    "description": step.description
                 }
                 for step in data.steps
             ]
+            
+            # ========== VALIDATION: Validate role mapping ==========
+            self._validate_role_mapping(flow_dict["steps"], flow_dict["roleToStepMapping"])
             
             document = {
                 **flow_dict,
@@ -157,7 +216,6 @@ class ApprovalFlowMasterService:
             
             # NOTIFICATION: In-App notification required
             # Code: NOTIF.APPROVAL_FLOW.CREATED.INAPP
-            # Channel: In-App
             # TODO: Implement notification service
             # self._notify_approval_flow_created(document, created_by)
             
@@ -209,6 +267,57 @@ class ApprovalFlowMasterService:
             # ERROR: Unexpected error during read operation
             raise DatabaseOperationError("READ", f"Unexpected error: {str(e)}")
     
+    # ========== GET UNIVERSAL WORKFLOW ==========
+    def get_universal_workflow(self) -> Optional[dict]:
+        """
+        Get the universal approval workflow.
+        
+        Returns:
+            dict: Universal workflow document or None if not found
+            
+        Raises:
+            DatabaseOperationError: If database operation fails
+        """
+        try:
+            result = self.collection.find_one({
+                "workflowType": "UNIVERSAL",
+                "isDeleted": False
+            })
+            
+            return result
+            
+        except PyMongoError as e:
+            raise DatabaseOperationError("GET_UNIVERSAL", str(e))
+        except Exception as e:
+            raise DatabaseOperationError("GET_UNIVERSAL", f"Unexpected error: {str(e)}")
+    
+    # ========== GET STARTING STEP FOR ROLE ==========
+    def get_starting_step_for_role(self, role: str) -> int:
+        """
+        Get the starting step number for a given initiator role.
+        
+        Args:
+            role: Initiator role (IO, SHO, CI, DSP, IT Core, Admin ASP)
+            
+        Returns:
+            int: Starting step number
+            
+        Raises:
+            ApprovalFlowNotFoundError: If universal workflow not found
+            InvalidRoleMappingError: If role not found in mapping
+        """
+        workflow = self.get_universal_workflow()
+        
+        if not workflow:
+            raise ApprovalFlowNotFoundError("UNIVERSAL")
+        
+        role_mapping = workflow.get("roleToStepMapping", {})
+        
+        if role not in role_mapping:
+            raise InvalidRoleMappingError(f"Role '{role}' not found in workflow mapping")
+        
+        return role_mapping[role]
+    
     # ========== UPDATE Operation (TFS: ApprovalFlowMaster.UPDATE) ==========
     def update_approval_flow(
         self,
@@ -224,11 +333,8 @@ class ApprovalFlowMasterService:
         Error Codes:
             - ERR.APPROVAL_FLOW.NOT_FOUND
             - ERR.APPROVAL_FLOW.INVALID_STEPS
+            - ERR.APPROVAL_FLOW.INVALID_ROLE_MAPPING
             - ERR.APPROVAL_FLOW.UPDATE.DB_ERROR
-        
-        Preconditions:
-            - _id must exist and not be deleted
-            - Steps must be valid (roles exist, orders unique/sequential)
         
         Args:
             flow_id: Approval flow ID to update
@@ -241,7 +347,7 @@ class ApprovalFlowMasterService:
             
         Raises:
             ApprovalFlowNotFoundError: If flow not found or deleted
-            InvalidStepsError: If steps validation fails
+            InvalidRoleMappingError: If role mapping validation fails
             DatabaseOperationError: If database operation fails
         """
         try:
@@ -256,22 +362,32 @@ class ApprovalFlowMasterService:
                 # Log: LOG.APPROVAL_FLOW.UPDATE.END.ERROR.NOT_FOUND
                 raise ApprovalFlowNotFoundError(str(flow_id))
             
-            # ========== VALIDATION: Steps validated by Pydantic ==========
-            # Pydantic validator ensures steps are valid
-            
             # ========== PREPARE UPDATE DATA ==========
-            update_dict = {
-                "steps": [
+            update_dict = data.model_dump(exclude_unset=True)
+            
+            # Convert steps if provided
+            if "steps" in update_dict and update_dict["steps"] is not None:
+                update_dict["steps"] = [
                     {
                         "role": step.role.value,
-                        "order": step.order
+                        "order": step.order,
+                        "description": step.description
                     }
                     for step in data.steps
-                ],
-                "updatedAt": datetime.now(timezone.utc),
-                "updatedBy": updated_by,
-                "updatedIp": updated_ip
-            }
+                ]
+            
+            # ========== VALIDATION: Validate role mapping if updated ==========
+            if "roleToStepMapping" in update_dict or "steps" in update_dict:
+                # Use updated or existing values
+                steps = update_dict.get("steps", existing.get("steps", []))
+                role_mapping = update_dict.get("roleToStepMapping", existing.get("roleToStepMapping", {}))
+                
+                self._validate_role_mapping(steps, role_mapping)
+            
+            # ========== ADD AUDIT FIELDS ==========
+            update_dict["updatedAt"] = datetime.now(timezone.utc)
+            update_dict["updatedBy"] = updated_by
+            update_dict["updatedIp"] = updated_ip
             
             # ========== DATABASE UPDATE ==========
             try:
@@ -298,8 +414,6 @@ class ApprovalFlowMasterService:
             # self._log_event("UPDATE", "SUCCESS", flow_id, updated_by)
             
             # NOTIFICATION: In-App notification required
-            # Code: NOTIF.APPROVAL_FLOW.UPDATED.INAPP
-            # Channel: In-App
             # TODO: Implement notification service
             # self._notify_approval_flow_updated(updated_document, updated_by)
             
@@ -328,20 +442,13 @@ class ApprovalFlowMasterService:
             - ERR.APPROVAL_FLOW.NOT_FOUND
             - ERR.APPROVAL_FLOW.DELETE.DB_ERROR
         
-        Preconditions:
-            - _id must exist and not already be deleted
-        
-        Postconditions:
-            - is_deleted=true
-            - audit fields updated
-        
         Args:
             flow_id: Approval flow ID to delete
             deleted_by: User ID performing the deletion
             deleted_ip: IP address of the deleter
             
         Returns:
-            bool: True if deleted, False if not found
+            bool: True if deleted
             
         Raises:
             ApprovalFlowNotFoundError: If flow not found
@@ -349,7 +456,6 @@ class ApprovalFlowMasterService:
         """
         try:
             # ========== DATABASE SOFT DELETE ==========
-            # TFS: Set is_deleted = True, update audit fields
             try:
                 result = self.collection.update_one(
                     {"_id": flow_id, "isDeleted": False},
@@ -365,37 +471,27 @@ class ApprovalFlowMasterService:
                 
                 if result.matched_count == 0:
                     # ERROR: Approval flow not found or already deleted
-                    # Log: LOG.APPROVAL_FLOW.DELETE.END.ERROR.NOT_FOUND
-                    # TFS: Already deleted → idempotent skip
                     raise ApprovalFlowNotFoundError(str(flow_id))
                 
             except PyMongoError as e:
                 # ERROR: Database delete operation failed
-                # Log: LOG.APPROVAL_FLOW.DELETE.END.ERROR.DB_FAILED
                 raise DatabaseOperationError("DELETE", str(e))
             
             # ========== POST-OPERATION TASKS ==========
             # Log: LOG.APPROVAL_FLOW.DELETE.END.SUCCESS
             # TODO: Implement logging
-            # self._log_event("DELETE", "SUCCESS", flow_id, deleted_by)
             
             # NOTIFICATION: In-App notification required
-            # Code: NOTIF.APPROVAL_FLOW.DELETED.INAPP
-            # Channel: In-App
             # TODO: Implement notification service
-            # self._notify_approval_flow_deleted(flow_id, deleted_by)
             
             return result.modified_count > 0
             
         except ApprovalFlowMasterError:
-            # Re-raise our custom errors
             raise
         except Exception as e:
-            # ERROR: Unexpected error during delete operation
-            # Log: LOG.APPROVAL_FLOW.DELETE.END.ERROR.UNEXPECTED
             raise DatabaseOperationError("DELETE", f"Unexpected error: {str(e)}")
     
-    # ========== SEARCH Operation (Extended TFS: ApprovalFlowMaster.READ) ==========
+    # ========== SEARCH Operation ==========
     def search_approval_flows(
         self,
         search_params: ApprovalFlowMasterSearchSchema
@@ -403,134 +499,53 @@ class ApprovalFlowMasterService:
         """
         Search and filter approval flows with pagination.
         
-        TFS Reference: ApprovalFlowMaster.READ (extended)
-        Supports: filtering by role, sorting, pagination
-        
         Args:
             search_params: Search and filter criteria
             
         Returns:
             Tuple[List[dict], int]: (list of documents, total count)
-            
-        Raises:
-            DatabaseOperationError: If database operation fails
         """
         try:
             # ========== BUILD QUERY FILTER ==========
             query = {}
             
-            # Include/exclude deleted records
             if not search_params.includeDeleted:
                 query["isDeleted"] = False
             
-            # Role filter (check if role exists in steps array)
+            if search_params.workflowType:
+                query["workflowType"] = search_params.workflowType
+            
             if search_params.role:
                 query["steps.role"] = search_params.role.value
             
             # ========== GET TOTAL COUNT ==========
-            try:
-                total = self.collection.count_documents(query)
-            except PyMongoError as e:
-                # ERROR: Count operation failed
-                raise DatabaseOperationError("SEARCH.COUNT", str(e))
+            total = self.collection.count_documents(query)
             
             # ========== BUILD SORT ==========
             sort_order = ASCENDING if search_params.sortOrder == "asc" else DESCENDING
-            sort_field = search_params.sortBy
             
             # ========== CALCULATE PAGINATION ==========
             skip = (search_params.page - 1) * search_params.pageSize
             
             # ========== EXECUTE QUERY ==========
-            try:
-                cursor = self.collection.find(query).sort(
-                    sort_field, sort_order
-                ).skip(skip).limit(search_params.pageSize)
-                
-                results = list(cursor)
-            except PyMongoError as e:
-                # ERROR: Search query execution failed
-                raise DatabaseOperationError("SEARCH.QUERY", str(e))
+            cursor = self.collection.find(query).sort(
+                search_params.sortBy, sort_order
+            ).skip(skip).limit(search_params.pageSize)
             
-            # Log: LOG.APPROVAL_FLOW.READ.END.SUCCESS
-            # TODO: Implement logging
+            results = list(cursor)
             
             return results, total
             
-        except ApprovalFlowMasterError:
-            # Re-raise our custom errors
-            raise
+        except PyMongoError as e:
+            raise DatabaseOperationError("SEARCH", str(e))
         except Exception as e:
-            # ERROR: Unexpected error during search operation
             raise DatabaseOperationError("SEARCH", f"Unexpected error: {str(e)}")
     
-    # ========== UTILITY: Get all approval flows ==========
+    # ========== UTILITY ==========
     def get_all_approval_flows(self, include_deleted: bool = False) -> List[dict]:
-        """
-        Get all approval flows (for dropdowns, etc.).
-        
-        Args:
-            include_deleted: Whether to include soft-deleted records
-            
-        Returns:
-            List[dict]: List of all approval flow documents
-            
-        Raises:
-            DatabaseOperationError: If database operation fails
-        """
+        """Get all approval flows."""
         try:
             query = {} if include_deleted else {"isDeleted": False}
             return list(self.collection.find(query).sort("createdAt", DESCENDING))
         except PyMongoError as e:
-            # ERROR: Get all operation failed
             raise DatabaseOperationError("GET_ALL", str(e))
-        except Exception as e:
-            # ERROR: Unexpected error
-            raise DatabaseOperationError("GET_ALL", f"Unexpected error: {str(e)}")
-    
-    # ========== PLACEHOLDER: Logging Methods ==========
-    # TODO: Implement actual logging service integration
-    
-    def _log_event(self, operation: str, status: str, record_id: PyObjectId, user_id: PyObjectId):
-        """
-        Log approval flow operation event.
-        
-        Logs:
-            - LOG.APPROVAL_FLOW.{operation}.END.{status}
-        
-        TODO: Implement actual logging to database or external service
-        """
-        pass
-    
-    # ========== PLACEHOLDER: Notification Methods ==========
-    # TODO: Implement actual notification service integration
-    
-    def _notify_approval_flow_created(self, document: dict, user_id: PyObjectId):
-        """
-        Send notification when approval flow is created.
-        
-        Notification Code: NOTIF.APPROVAL_FLOW.CREATED.INAPP
-        Channel: In-App
-        TODO: Implement notification service
-        """
-        pass
-    
-    def _notify_approval_flow_updated(self, document: dict, user_id: PyObjectId):
-        """
-        Send notification when approval flow is updated.
-        
-        Notification Code: NOTIF.APPROVAL_FLOW.UPDATED.INAPP
-        Channel: In-App
-        TODO: Implement notification service
-        """
-        pass
-    
-    def _notify_approval_flow_deleted(self, flow_id: PyObjectId, user_id: PyObjectId):
-        """
-        Send notification when approval flow is deleted.
-        
-        Notification Code: NOTIF.APPROVAL_FLOW.DELETED.INAPP
-        Channel: In-App
-        TODO: Implement notification service
-        """
-        pass
