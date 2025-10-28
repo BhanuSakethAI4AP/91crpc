@@ -1,5 +1,6 @@
 """
 Purpose: Business logic for Consolidated CrPC Requests.
+UPDATED: Operator-centric consolidation (groups by operator only, not by service).
 Core consolidation functionality - format generation to be implemented later.
 """
 
@@ -36,8 +37,19 @@ class NotFoundError(ConsolidatedError):
 
 
 class NoPipelinesError(ConsolidatedError):
-    def __init__(self):
-        super().__init__("No approved pipelines available", "ERR.CONSOLIDATED.NO_PIPELINES")
+    def __init__(self, operator_id: str):
+        super().__init__(
+            f"No approved pipelines available for operator '{operator_id}'",
+            "ERR.CONSOLIDATED.NO_PIPELINES"
+        )
+
+
+class InvalidOperatorError(ConsolidatedError):
+    def __init__(self, operator_id: str):
+        super().__init__(
+            f"Operator '{operator_id}' not found or invalid",
+            "ERR.CONSOLIDATED.INVALID_OPERATOR"
+        )
 
 
 class DatabaseOperationError(ConsolidatedError):
@@ -50,7 +62,7 @@ class DatabaseOperationError(ConsolidatedError):
 
 # ========== Service Class ==========
 class ConsolidatedCrpcRequestsService:
-    """Service for consolidated CrPC requests."""
+    """Service for consolidated CrPC requests (Operator-Centric)."""
     
     def __init__(self):
         """Initialize with database collections."""
@@ -68,15 +80,26 @@ class ConsolidatedCrpcRequestsService:
         except Exception as e:
             raise DatabaseOperationError("INIT", str(e))
     
-    # ========== FIND CONSOLIDATABLE PIPELINES ==========
+    # ========== FIND CONSOLIDATABLE PIPELINES (OPERATOR-CENTRIC) ==========
     def find_consolidatable_pipelines(
         self,
-        service_id: Optional[PyObjectId] = None,
         operator_id: Optional[PyObjectId] = None
     ) -> Dict[str, List[dict]]:
         """
         Find approved pipelines that can be consolidated.
-        Groups by (serviceId, operatorId).
+        
+        IMPORTANT: Groups by OPERATOR only (not by service).
+        Filters by service.canBeConsolidated = true.
+        
+        Args:
+            operator_id: Optional operator filter
+            
+        Returns:
+            Dict[str, List[dict]]: Grouped by operator_id
+                Example: {
+                    "operator_id_1": [pipeline1, pipeline2, pipeline3],  # Mixed services
+                    "operator_id_2": [pipeline4, pipeline5]
+                }
         """
         try:
             query = {
@@ -84,8 +107,6 @@ class ConsolidatedCrpcRequestsService:
                 "isActive": True
             }
             
-            if service_id:
-                query["serviceId"] = service_id
             if operator_id:
                 query["operatorId"] = operator_id
             
@@ -95,19 +116,28 @@ class ConsolidatedCrpcRequestsService:
                 return {}
             
             # Filter by canBeConsolidated
+            print(f"\n🔍 Filtering by canBeConsolidated flag...")
             consolidatable = []
+            non_consolidatable = []
+            
             for pipeline in pipelines:
                 service = self.service_collection.find_one({"_id": pipeline["serviceId"]})
                 if service and service.get("canBeConsolidated", False):
                     consolidatable.append(pipeline)
+                else:
+                    non_consolidatable.append(pipeline)
+                    print(f"  ⚠️  Skipping pipeline {pipeline['_id']} - Service '{service.get('serviceName')}' canBeConsolidated=false")
             
-            # Group by (serviceId, operatorId)
+            print(f"✓ Consolidatable: {len(consolidatable)}")
+            print(f"✗ Non-consolidatable: {len(non_consolidatable)}")
+            
+            # Group by OPERATOR only
             grouped = {}
             for pipeline in consolidatable:
-                key = f"{pipeline['serviceId']}_{pipeline['operatorId']}"
-                if key not in grouped:
-                    grouped[key] = []
-                grouped[key].append(pipeline)
+                operator_id_str = str(pipeline['operatorId'])
+                if operator_id_str not in grouped:
+                    grouped[operator_id_str] = []
+                grouped[operator_id_str].append(pipeline)
             
             return grouped
             
@@ -117,30 +147,41 @@ class ConsolidatedCrpcRequestsService:
     # ========== GET AVAILABLE CONSOLIDATIONS ==========
     def get_available_consolidations(self) -> List[Dict[str, Any]]:
         """
-        Get list of service-operator combinations ready for consolidation.
+        Get list of operators ready for consolidation.
         
-        Returns summary with count of pending pipelines for each combination.
+        Returns summary with count of pending pipelines PER OPERATOR.
+        Includes breakdown by service types within each operator.
         """
         try:
             grouped = self.find_consolidatable_pipelines()
             
             available = []
-            for key, pipelines in grouped.items():
-                service_id, operator_id = key.split("_")
+            for operator_id_str, pipelines in grouped.items():
+                operator = self.operator_collection.find_one({"_id": PyObjectId(operator_id_str)})
                 
-                service = self.service_collection.find_one({"_id": PyObjectId(service_id)})
-                operator = self.operator_collection.find_one({"_id": PyObjectId(operator_id)})
+                # Build service breakdown
+                service_breakdown = {}
+                for pipeline in pipelines:
+                    service_id_str = str(pipeline["serviceId"])
+                    if service_id_str not in service_breakdown:
+                        service = self.service_collection.find_one({"_id": pipeline["serviceId"]})
+                        service_breakdown[service_id_str] = {
+                            "serviceId": service_id_str,
+                            "serviceName": service.get("serviceName") if service else "Unknown",
+                            "count": 0
+                        }
+                    service_breakdown[service_id_str]["count"] += 1
                 
                 available.append({
-                    "serviceId": service_id,
-                    "serviceName": service.get("serviceName") if service else "Unknown",
-                    "operatorId": operator_id,
+                    "operatorId": operator_id_str,
                     "operatorName": operator.get("operatorName") if operator else "Unknown",
                     "pipelineCount": len(pipelines),
+                    "serviceBreakdown": list(service_breakdown.values()),
                     "oldestRequestDate": min(
                         p.get("createdAt", datetime.now(timezone.utc)) 
                         for p in pipelines
-                    ) if pipelines else None
+                    ) if pipelines else None,
+                    "totalPipelinesValue": len(pipelines)  # Backward compatibility
                 })
             
             return available
@@ -148,116 +189,257 @@ class ConsolidatedCrpcRequestsService:
         except Exception as e:
             raise DatabaseOperationError("GET_AVAILABLE", str(e))
     
+    # ========== GET FORMAT CONFIG ==========
+    def _get_format_config(
+        self,
+        operator_id: PyObjectId,
+        pipelines: List[dict]
+    ) -> Dict[str, Any]:
+        """
+        Get format configuration for operator consolidation.
+        
+        Resolution Logic:
+        1. Get operator config from operator_service_list
+        2. For each service in pipelines:
+           - Check if serviceSpecificFormat exists
+           - Otherwise use globalFormat
+        3. Return combined format config
+        
+        Args:
+            operator_id: Operator ID
+            pipelines: List of pipelines (may have mixed services)
+            
+        Returns:
+            dict: Format configuration
+        """
+        try:
+            # Get operator config
+            operator_config = self.operator_service_collection.find_one({
+                "operatorId": operator_id,
+                "isDeleted": False
+            })
+            
+            if not operator_config:
+                print(f"⚠️  No format config found for operator {operator_id}")
+                return {}
+            
+            # Get unique services in pipelines
+            service_ids = list(set(str(p["serviceId"]) for p in pipelines))
+            
+            # Build format config
+            format_config = {
+                "operatorId": operator_id,
+                "globalFormat": operator_config.get("globalFormat"),
+                "serviceFormats": {}
+            }
+            
+            # Get format for each service
+            for service_id_str in service_ids:
+                service_id = PyObjectId(service_id_str)
+                
+                # Find service in operator's services array
+                service_config = None
+                for svc in operator_config.get("services", []):
+                    if svc.get("serviceId") == service_id:
+                        service_config = svc
+                        break
+                
+                if service_config:
+                    # Determine format source
+                    if service_config.get("serviceSpecificFormat"):
+                        format_config["serviceFormats"][service_id_str] = {
+                            "source": "service-specific",
+                            "format": service_config["serviceSpecificFormat"],
+                            "requiredData": service_config.get("requiredData", {})
+                        }
+                    elif format_config["globalFormat"]:
+                        format_config["serviceFormats"][service_id_str] = {
+                            "source": "global",
+                            "format": format_config["globalFormat"],
+                            "requiredData": service_config.get("requiredData", {})
+                        }
+            
+            return format_config
+            
+        except Exception as e:
+            print(f"Error getting format config: {str(e)}")
+            return {}
+    
     # ========== GENERATE OUTPUT FILE (PLACEHOLDER) ==========
     def _generate_output_file(
         self,
         pipelines: List[dict],
-        service_id: PyObjectId,
         operator_id: PyObjectId,
-        service_name: str,
         operator_name: str
-    ) -> str:
+    ) -> Tuple[str, List[Dict[str, str]]]:
         """
         Generate output file based on operator format configuration.
         
+        IMPORTANT: Single file for ALL services from the operator.
+        
         TODO: Implement format-specific generation:
-        - Excel: Dynamic column mapping
+        - Excel: Dynamic column mapping with multiple sheets (one per service)
         - Word: Template-based generation
         - PDF: Template conversion
         - AI: Custom format conversion
         
-        For now: Creates placeholder file.
+        Args:
+            pipelines: List of pipelines (can be mixed services)
+            operator_id: Operator ID
+            operator_name: Operator name
+            
+        Returns:
+            Tuple[str, List[dict]]: (filepath, attachments list)
         """
         try:
-            print(f"📄 Generating output file for {operator_name} - {service_name}")
+            print(f"📄 Generating output file for {operator_name}")
             
-            # TODO: Get format config from operator_service_list
-            # format_config = self._get_format_config(service_id, operator_id)
-            # format_type = format_config.get("formatType", "excel")
+            # Get format config
+            format_config = self._get_format_config(operator_id, pipelines)
             
-            # TODO: Route to appropriate generator
-            # if format_type == "excel":
-            #     return self._generate_excel(pipelines, format_config)
-            # elif format_type == "docx":
-            #     return self._generate_docx(pipelines, format_config)
-            # elif format_type == "ai_custom":
-            #     return self._generate_with_ai(pipelines, format_config)
+            # Group pipelines by service
+            by_service = {}
+            for pipeline in pipelines:
+                service_id_str = str(pipeline["serviceId"])
+                if service_id_str not in by_service:
+                    service = self.service_collection.find_one({"_id": pipeline["serviceId"]})
+                    by_service[service_id_str] = {
+                        "serviceName": service.get("serviceName") if service else "Unknown",
+                        "pipelines": []
+                    }
+                by_service[service_id_str]["pipelines"].append(pipeline)
+            
+            print(f"  Services in consolidation: {list(by_service.keys())}")
+            
+            # TODO: Get format config and route to appropriate generator
+            # if format_config.get("formatType") == "excel":
+            #     return self._generate_excel(pipelines, by_service, format_config)
+            # elif format_config.get("formatType") == "docx":
+            #     return self._generate_docx(pipelines, by_service, format_config)
+            # elif format_config.get("formatType") == "ai_custom":
+            #     return self._generate_with_ai(pipelines, by_service, format_config)
             
             # PLACEHOLDER: Simple text file for now
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"{operator_name}_{service_name}_{timestamp}.txt"
+            filename = f"{operator_name}_AllServices_{timestamp}.txt"
             filepath = os.path.join(self.upload_dir, filename)
             
             with open(filepath, 'w') as f:
-                f.write(f"Consolidated Request\n")
+                f.write(f"{'='*60}\n")
+                f.write(f"CONSOLIDATED REQUEST - ALL SERVICES\n")
+                f.write(f"{'='*60}\n\n")
                 f.write(f"Operator: {operator_name}\n")
-                f.write(f"Service: {service_name}\n")
-                f.write(f"Total Pipelines: {len(pipelines)}\n\n")
+                f.write(f"Total Pipelines: {len(pipelines)}\n")
+                f.write(f"Services: {len(by_service)}\n")
+                f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                 
-                for idx, pipeline in enumerate(pipelines, 1):
-                    f.write(f"{idx}. Pipeline ID: {pipeline['_id']}\n")
-                    f.write(f"   Key Value: {pipeline.get('keyFieldValue')}\n")
-                    f.write(f"   From: {pipeline.get('requiredData', {}).get('fromDate')}\n")
-                    f.write(f"   To: {pipeline.get('requiredData', {}).get('toDate')}\n\n")
+                # Write each service section
+                for service_id_str, service_data in by_service.items():
+                    f.write(f"\n{'='*60}\n")
+                    f.write(f"SERVICE: {service_data['serviceName']}\n")
+                    f.write(f"{'='*60}\n\n")
+                    f.write(f"Total Requests: {len(service_data['pipelines'])}\n\n")
+                    
+                    for idx, pipeline in enumerate(service_data['pipelines'], 1):
+                        f.write(f"{idx}. Pipeline ID: {pipeline['_id']}\n")
+                        f.write(f"   Key Value: {pipeline.get('keyFieldValue')}\n")
+                        
+                        required_data = pipeline.get('requiredData', {})
+                        if required_data:
+                            if 'fromDate' in required_data:
+                                f.write(f"   From: {required_data.get('fromDate')}\n")
+                            if 'toDate' in required_data:
+                                f.write(f"   To: {required_data.get('toDate')}\n")
+                        
+                        f.write(f"\n")
             
             print(f"✓ Placeholder file created: {filepath}")
-            print(f"  NOTE: Format-specific generation to be implemented")
+           
             
-            return filepath
+            # Get attachments from operator config
+            attachments = []
+            if format_config.get("globalFormat"):
+                attachments = format_config["globalFormat"].get("listOfAttachments", [])
+            
+            return filepath, attachments
             
         except Exception as e:
             import traceback
             print(f"Error generating file: {traceback.format_exc()}")
             raise ConsolidatedError(f"File generation failed: {str(e)}", "ERR.FILE_GENERATION")
     
-    # ========== CREATE CONSOLIDATION ==========
+    # ========== CREATE CONSOLIDATION (OPERATOR-CENTRIC) ==========
     def create_consolidation(
         self,
-        service_id: PyObjectId,
         operator_id: PyObjectId,
         mode: DispatchMode,
         created_by: PyObjectId,
         created_ip: str
     ) -> dict:
-        """Create consolidated request."""
+        """
+        Create consolidated request for an operator.
+        
+        IMPORTANT: Consolidates ALL services for the operator in ONE file.
+        
+        Args:
+            operator_id: Operator ID (PRIMARY grouping)
+            mode: Dispatch mode
+            created_by: User creating the consolidation
+            created_ip: IP address
+            
+        Returns:
+            dict: Created consolidation document
+        """
         try:
             print(f"\n{'='*60}")
-            print(f"📦 Creating Consolidated Request")
+            print(f"📦 Creating Consolidated Request (Operator-Centric)")
             print(f"{'='*60}")
             
-            # Step 1: Find pipelines
-            print(f"\n🔍 Finding consolidatable pipelines...")
-            grouped = self.find_consolidatable_pipelines(service_id, operator_id)
-            key = f"{service_id}_{operator_id}"
+            # Validate operator exists
+            operator = self.operator_collection.find_one({"_id": operator_id, "isDeleted": False})
+            if not operator:
+                raise InvalidOperatorError(str(operator_id))
             
-            if key not in grouped or not grouped[key]:
-                raise NoPipelinesError()
-            
-            pipelines = grouped[key]
-            print(f"✓ Found {len(pipelines)} pipelines")
-            
-            # Get names
-            service = self.service_collection.find_one({"_id": service_id})
-            operator = self.operator_collection.find_one({"_id": operator_id})
-            service_name = service.get("serviceName", "Unknown")
             operator_name = operator.get("operatorName", "Unknown")
+            print(f"Operator: {operator_name}")
             
-            # Step 2: Generate output file
-            print(f"\n📄 Generating output file...")
-            output_filepath = self._generate_output_file(
-                pipelines, service_id, operator_id, service_name, operator_name
+            # Step 1: Find pipelines (by operator only)
+            print(f"\n🔍 Finding consolidatable pipelines...")
+            grouped = self.find_consolidatable_pipelines(operator_id)
+            operator_id_str = str(operator_id)
+            
+            if operator_id_str not in grouped or not grouped[operator_id_str]:
+                raise NoPipelinesError(str(operator_id))
+            
+            pipelines = grouped[operator_id_str]
+            
+            # Count services
+            service_ids = set(str(p["serviceId"]) for p in pipelines)
+            print(f"✓ Found {len(pipelines)} pipelines across {len(service_ids)} services")
+            
+            # Show service breakdown
+            for service_id_str in service_ids:
+                service = self.service_collection.find_one({"_id": PyObjectId(service_id_str)})
+                service_name = service.get("serviceName") if service else "Unknown"
+                count = sum(1 for p in pipelines if str(p["serviceId"]) == service_id_str)
+                print(f"   - {service_name}: {count} pipelines")
+            
+            # Step 2: Generate output file (single file for all services)
+         
+            output_filepath, attachments = self._generate_output_file(
+                pipelines, operator_id, operator_name
             )
             
             # Step 3: Create record
-            print(f"\n💾 Creating consolidated record...")
+           
             now = datetime.now(timezone.utc)
             
             document = {
                 "mode": mode.value,
-                "serviceId": service_id,
+                # serviceId removed - operator-centric
                 "operatorId": operator_id,
                 "crpcRequestPipelineIds": [p["_id"] for p in pipelines],
-                "attachmentsForSendingMail": [],
+                "attachmentsForSendingMail": attachments,
                 "letterFilePaths": [{
                     "attachmentName": os.path.basename(output_filepath),
                     "formatFilePath": output_filepath
@@ -284,6 +466,7 @@ class ConsolidatedCrpcRequestsService:
                 {"_id": {"$in": [p["_id"] for p in pipelines]}},
                 {"$set": {
                     "lineItemRequestStatus": "Consolidated",
+                    "consolidatedRequestId": result.inserted_id,  # Link back
                     "updatedAt": now,
                     "updatedBy": created_by,
                     "updatedIp": created_ip
@@ -293,6 +476,9 @@ class ConsolidatedCrpcRequestsService:
             
             print(f"\n{'='*60}")
             print(f"✅ Consolidation Complete")
+            print(f"   Operator: {operator_name}")
+            print(f"   Services: {len(service_ids)}")
+            print(f"   Pipelines: {len(pipelines)}")
             print(f"{'='*60}\n")
             
             return document
@@ -321,12 +507,20 @@ class ConsolidatedCrpcRequestsService:
         downloaded_by: PyObjectId,
         downloaded_ip: str
     ) -> dict:
-        """Mark as downloaded."""
+        """
+        Mark consolidation as downloaded.
+        
+        Only updates status on first download (idempotent).
+        """
         try:
             now = datetime.now(timezone.utc)
             
-            self.collection.update_one(
-                {"_id": consolidated_id},
+            # Only update if not already downloaded
+            result = self.collection.update_one(
+                {
+                    "_id": consolidated_id,
+                    "consolidatedCrpcRequestStatus": ConsolidatedRequestStatus.NOT_DOWNLOADED.value
+                },
                 {"$set": {
                     "consolidatedCrpcRequestStatus": ConsolidatedRequestStatus.DOWNLOADED.value,
                     "downloadedAt": now,
@@ -335,6 +529,11 @@ class ConsolidatedCrpcRequestsService:
                     "updatedIp": downloaded_ip
                 }}
             )
+            
+            if result.modified_count == 0:
+                print(f"⚠️  Consolidation {consolidated_id} already downloaded")
+            else:
+                print(f"✓ Marked as downloaded: {consolidated_id}")
             
             return self.collection.find_one({"_id": consolidated_id})
             
@@ -349,12 +548,20 @@ class ConsolidatedCrpcRequestsService:
             
             if not search_params.includeInactive:
                 query["isActive"] = True
-            if search_params.serviceId:
-                query["serviceId"] = search_params.serviceId
+            
+            # Operator filter (PRIMARY)
             if search_params.operatorId:
                 query["operatorId"] = search_params.operatorId
+            
+            # Status filter
             if search_params.status:
                 query["consolidatedCrpcRequestStatus"] = search_params.status.value
+            
+            # Mode filter
+            if search_params.mode:
+                query["mode"] = search_params.mode.value
+            
+            # Date range
             if search_params.createdDateFrom or search_params.createdDateTo:
                 query["createdAt"] = {}
                 if search_params.createdDateFrom:
@@ -382,8 +589,18 @@ class ConsolidatedCrpcRequestsService:
         deleted_by: PyObjectId,
         deleted_ip: str
     ) -> bool:
-        """Soft delete consolidated request."""
+        """
+        Soft delete consolidated request.
+        
+        Also reverts pipeline statuses back to "Approved".
+        """
         try:
+            # Get consolidation
+            consolidation = self.get_by_id(consolidated_id)
+            if not consolidation:
+                raise NotFoundError(str(consolidated_id))
+            
+            # Soft delete consolidation
             result = self.collection.update_one(
                 {"_id": consolidated_id, "isActive": True},
                 {"$set": {
@@ -393,6 +610,20 @@ class ConsolidatedCrpcRequestsService:
                     "updatedIp": deleted_ip
                 }}
             )
+            
+            if result.modified_count > 0:
+                # Revert pipelines back to "Approved"
+                self.pipeline_collection.update_many(
+                    {"_id": {"$in": consolidation.get("crpcRequestPipelineIds", [])}},
+                    {"$set": {
+                        "lineItemRequestStatus": "Approved",
+                        "consolidatedRequestId": None,
+                        "updatedAt": datetime.now(timezone.utc),
+                        "updatedBy": deleted_by,
+                        "updatedIp": deleted_ip
+                    }}
+                )
+                print(f"✓ Deleted consolidation and reverted pipelines")
             
             return result.modified_count > 0
             

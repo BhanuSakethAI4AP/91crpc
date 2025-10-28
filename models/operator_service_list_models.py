@@ -2,6 +2,7 @@
 Purpose: Pydantic schemas for Operator Service List CRUD operations.
 Handles validation and serialization for operator-service mappings.
 
+UPDATED: Operator-centric design with globalFormat and service-specific overrides.
 Based on TFS: OperatorServiceList.CREATE, READ, UPDATE, DELETE
 """
 
@@ -34,65 +35,124 @@ class AttachmentSchema(BaseModel):
     )
 
 
-# ========== Operator Format Schema ==========
-class OperatorFormatSchema(BaseModel):
+# ========== Format Schema (Used for both global and service-specific) ==========
+class FormatSchema(BaseModel):
     """
-    Format specification for a specific operator.
-    Defines the template and attachments required for each operator.
+    Format configuration containing file path and attachments.
+    Used for both globalFormat and serviceSpecificFormat.
     """
-    operatorId: PyObjectId = Field(
-        ...,
-        description="Reference to operator in operators_list collection"
-    )
     formatFilePath: str = Field(
         ...,
         min_length=1,
         max_length=500,
-        description="Path to the operator-specific format template",
-        examples=["/formats/airtel.xlsx", "/formats/jio_template.xlsx"]
+        description="Path to the format template file",
+        examples=["/formats/airtel_all_services.xlsx", "/formats/airtel_cdr.xlsx"]
     )
     listOfAttachments: List[AttachmentSchema] = Field(
         default_factory=list,
-        description="List of attachments required for this operator"
+        description="List of attachments required for this format"
+    )
+
+
+# ========== Service Configuration Schema ==========
+class ServiceConfigSchema(BaseModel):
+    """
+    Configuration for a specific service provided by the operator.
+    Contains service-specific format overrides and requirements.
+    """
+    serviceId: PyObjectId = Field(
+        ...,
+        description="Reference to service in service_master collection"
+    )
+    serviceName: Optional[str] = Field(
+        None,
+        max_length=100,
+        description="Denormalized service name for quick lookup"
+    )
+    serviceSpecificFormat: Optional[FormatSchema] = Field(
+        None,
+        description="Service-specific format (overrides globalFormat if provided)"
+    )
+    requiredData: Optional[Dict[str, Any]] = Field(
+        default_factory=dict,
+        description="Required data fields for this service",
+        examples=[
+            {"fromDate": "datetime", "toDate": "datetime"},
+            {"fromDate": "datetime", "toDate": "datetime", "cellId": "string"}
+        ]
+    )
+    maxDateRange: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Maximum date range in days (if applicable)"
+    )
+    turnaroundTime: Optional[int] = Field(
+        None,
+        ge=1,
+        description="Expected turnaround time in days"
+    )
+    isActive: bool = Field(
+        default=True,
+        description="Whether this service is currently active for the operator"
     )
 
 
 # ========== Base Schema ==========
 class OperatorServiceListBase(BaseModel):
     """
-    Base schema with common fields for Operator Service List.
-    Maps services to operator-specific formats and requirements.
+    Base schema for Operator Service List (operator-centric).
+    Maps operator to multiple services with format configurations.
     """
-    serviceId: PyObjectId = Field(
+    operatorId: PyObjectId = Field(
         ...,
-        description="Reference to service in service_master collection"
+        description="PRIMARY: Reference to operator in operators_list collection"
     )
-    operatorFormats: List[OperatorFormatSchema] = Field(
+    operatorName: Optional[str] = Field(
+        None,
+        max_length=100,
+        description="Denormalized operator name for quick lookup"
+    )
+    globalFormat: Optional[FormatSchema] = Field(
+        None,
+        description="Global format used for all services (unless overridden)"
+    )
+    services: List[ServiceConfigSchema] = Field(
         ...,
         min_items=1,
-        description="List of operator-specific format configurations"
-    )
-    requiredData: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Additional data requirements (e.g., date ranges, fields)",
-        examples=[
-            {"fromDate": "2025-09-01", "toDate": "2025-09-30"},
-            {"fields": ["callerId", "duration", "location"]}
-        ]
+        description="List of services provided by this operator"
     )
 
-    @field_validator('operatorFormats')
+    @field_validator('services')
     @classmethod
-    def validate_unique_operators(cls, v: List[OperatorFormatSchema]) -> List[OperatorFormatSchema]:
+    def validate_unique_services(cls, v: List[ServiceConfigSchema]) -> List[ServiceConfigSchema]:
         """
-        Validate that operatorIds are unique within the list.
+        Validate that serviceIds are unique within the list.
         
         Raises:
-            ValueError: If duplicate operator IDs found
+            ValueError: If duplicate service IDs found
         """
-        operator_ids = [fmt.operatorId for fmt in v]
-        if len(operator_ids) != len(set(operator_ids)):
-            raise ValueError("Duplicate operator IDs found in operatorFormats")
+        service_ids = [svc.serviceId for svc in v]
+        if len(service_ids) != len(set(service_ids)):
+            raise ValueError("Duplicate service IDs found in services list")
+        return v
+
+    @field_validator('services')
+    @classmethod
+    def validate_format_availability(cls, v: List[ServiceConfigSchema], info) -> List[ServiceConfigSchema]:
+        """
+        Validate that each service has either serviceSpecificFormat or globalFormat available.
+        
+        Raises:
+            ValueError: If no format is available for a service
+        """
+        # Access globalFormat from the parent model if available
+        global_format = info.data.get('globalFormat')
+        
+        for service in v:
+            if not service.serviceSpecificFormat and not global_format:
+                raise ValueError(
+                    f"Service {service.serviceId} has no serviceSpecificFormat and no globalFormat is defined"
+                )
         return v
 
 
@@ -103,9 +163,10 @@ class OperatorServiceListCreateSchema(OperatorServiceListBase):
     
     TFS Reference: OperatorServiceList.CREATE
     Preconditions:
-        - serviceId exists in service_master
-        - all operatorIds exist in operators_list
-        - no duplicate operatorFormats per serviceId
+        - operatorId exists in operators_list
+        - all serviceIds exist in service_master
+        - no duplicate services per operator
+        - each service has format available (global or specific)
     """
     pass
 
@@ -118,25 +179,30 @@ class OperatorServiceListUpdateSchema(BaseModel):
     
     TFS Reference: OperatorServiceList.UPDATE
     """
-    operatorFormats: Optional[List[OperatorFormatSchema]] = Field(
+    operatorName: Optional[str] = Field(
+        None,
+        max_length=100,
+        description="Updated operator name"
+    )
+    globalFormat: Optional[FormatSchema] = Field(
+        None,
+        description="Updated global format"
+    )
+    services: Optional[List[ServiceConfigSchema]] = Field(
         None,
         min_items=1,
-        description="Updated operator format configurations"
-    )
-    requiredData: Optional[Dict[str, Any]] = Field(
-        None,
-        description="Updated data requirements"
+        description="Updated services list"
     )
 
-    @field_validator('operatorFormats')
+    @field_validator('services')
     @classmethod
-    def validate_unique_operators(cls, v: Optional[List[OperatorFormatSchema]]) -> Optional[List[OperatorFormatSchema]]:
-        """Validate unique operator IDs if provided."""
+    def validate_unique_services(cls, v: Optional[List[ServiceConfigSchema]]) -> Optional[List[ServiceConfigSchema]]:
+        """Validate unique service IDs if provided."""
         if v is None:
             return v
-        operator_ids = [fmt.operatorId for fmt in v]
-        if len(operator_ids) != len(set(operator_ids)):
-            raise ValueError("Duplicate operator IDs found in operatorFormats")
+        service_ids = [svc.serviceId for svc in v]
+        if len(service_ids) != len(set(service_ids)):
+            raise ValueError("Duplicate service IDs found in services list")
         return v
 
 
@@ -161,28 +227,72 @@ class OperatorServiceListResponseSchema(OperatorServiceListBase):
         json_schema_extra = {
             "example": {
                 "_id": "671000000000000000000301",
-                "serviceId": "671000000000000000000101",
-                "operatorFormats": [
+                "operatorId": "671000000000000000000201",
+                "operatorName": "Airtel",
+                "globalFormat": {
+                    "formatFilePath": "/formats/airtel_all_services.xlsx",
+                    "listOfAttachments": [
+                        {
+                            "attachmentName": "Authorization Letter",
+                            "formatFilePath": "/attachments/airtel/authorization_global.pdf"
+                        },
+                        {
+                            "attachmentName": "Court Order",
+                            "formatFilePath": "/attachments/airtel/court_order.pdf"
+                        }
+                    ]
+                },
+                "services": [
                     {
-                        "operatorId": "671000000000000000000201",
-                        "formatFilePath": "/formats/airtel.xlsx",
-                        "listOfAttachments": [
-                            {
-                                "attachmentName": "Authorization",
-                                "formatFilePath": "/attachments/airtel/auth.pdf"
-                            }
-                        ]
+                        "serviceId": "671000000000000000000101",
+                        "serviceName": "CDR",
+                        "serviceSpecificFormat": None,
+                        "requiredData": {
+                            "fromDate": "datetime",
+                            "toDate": "datetime"
+                        },
+                        "maxDateRange": 90,
+                        "turnaroundTime": 7,
+                        "isActive": True
+                    },
+                    {
+                        "serviceId": "671000000000000000000104",
+                        "serviceName": "IMEI Details",
+                        "serviceSpecificFormat": None,
+                        "requiredData": {},
+                        "maxDateRange": None,
+                        "turnaroundTime": 3,
+                        "isActive": True
+                    },
+                    {
+                        "serviceId": "671000000000000000000105",
+                        "serviceName": "Tower Dump",
+                        "serviceSpecificFormat": {
+                            "formatFilePath": "/formats/airtel_tower_dump_special.xlsx",
+                            "listOfAttachments": [
+                                {
+                                    "attachmentName": "Tower Authorization",
+                                    "formatFilePath": "/attachments/airtel/tower_auth.pdf"
+                                }
+                            ]
+                        },
+                        "requiredData": {
+                            "fromDate": "datetime",
+                            "toDate": "datetime",
+                            "cellId": "string",
+                            "latitude": "number",
+                            "longitude": "number"
+                        },
+                        "maxDateRange": None,
+                        "turnaroundTime": 10,
+                        "isActive": True
                     }
                 ],
-                "requiredData": {
-                    "fromDate": "2025-09-01",
-                    "toDate": "2025-09-30"
-                },
                 "isDeleted": False,
-                "createdAt": "2025-09-01T10:00:00.000Z",
+                "createdAt": "2025-01-20T10:00:00.000Z",
                 "createdBy": "6710000000000000000000a2",
                 "createdIp": "10.10.10.21",
-                "updatedAt": "2025-10-01T10:00:00.000Z",
+                "updatedAt": "2025-01-20T10:00:00.000Z",
                 "updatedBy": "6710000000000000000000a2",
                 "updatedIp": "10.10.10.21"
             }
@@ -195,15 +305,20 @@ class OperatorServiceListSearchSchema(BaseModel):
     Schema for searching and filtering operator service mappings.
     
     TFS Reference: OperatorServiceList.READ
-    Supports filtering by serviceId, operatorId, isDeleted
+    Supports filtering by operatorId, serviceId, isDeleted
     """
-    serviceId: Optional[PyObjectId] = Field(
-        None,
-        description="Filter by service ID"
-    )
     operatorId: Optional[PyObjectId] = Field(
         None,
-        description="Filter by operator ID (within operatorFormats)"
+        description="Filter by operator ID"
+    )
+    serviceId: Optional[PyObjectId] = Field(
+        None,
+        description="Filter by service ID (searches within services array)"
+    )
+    operatorName: Optional[str] = Field(
+        None,
+        max_length=100,
+        description="Filter by operator name (partial match)"
     )
     includeDeleted: bool = Field(
         default=False,
@@ -213,7 +328,7 @@ class OperatorServiceListSearchSchema(BaseModel):
     # Sorting
     sortBy: str = Field(
         default="createdAt",
-        description="Field to sort by (serviceId, createdAt, updatedAt)"
+        description="Field to sort by (operatorName, createdAt, updatedAt)"
     )
     sortOrder: str = Field(
         default="desc",
@@ -228,7 +343,7 @@ class OperatorServiceListSearchSchema(BaseModel):
     @classmethod
     def validate_sort_field(cls, v: str) -> str:
         """Validate sort field is allowed."""
-        allowed_fields = {"serviceId", "createdAt", "updatedAt"}
+        allowed_fields = {"operatorId", "operatorName", "createdAt", "updatedAt"}
         if v not in allowed_fields:
             raise ValueError(f"sortBy must be one of {allowed_fields}")
         return v
@@ -250,3 +365,23 @@ class OperatorServiceListListResponseSchema(BaseModel):
     page: int = Field(..., description="Current page number")
     pageSize: int = Field(..., description="Items per page")
     totalPages: int = Field(..., description="Total number of pages")
+
+
+# ========== Service Format Resolution Schema ==========
+class ServiceFormatResponseSchema(BaseModel):
+    """
+    Response schema for resolved format configuration.
+    Used when querying which format to use for a specific service.
+    """
+    operatorId: PyObjectId = Field(..., description="Operator ID")
+    operatorName: str = Field(..., description="Operator name")
+    serviceId: PyObjectId = Field(..., description="Service ID")
+    serviceName: str = Field(..., description="Service name")
+    formatSource: str = Field(
+        ...,
+        description="Source of format: 'global' or 'service-specific'"
+    )
+    format: FormatSchema = Field(..., description="Resolved format configuration")
+    requiredData: Dict[str, Any] = Field(..., description="Required data fields")
+    maxDateRange: Optional[int] = Field(None, description="Maximum date range")
+    turnaroundTime: Optional[int] = Field(None, description="Expected TAT")

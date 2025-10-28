@@ -2,13 +2,14 @@
 Purpose: Business logic for Operator Service List operations.
 Handles CRUD operations for operator-service mappings with comprehensive error handling.
 
+UPDATED: Operator-centric design with globalFormat and service-specific overrides.
 Based on TFS: OperatorServiceList.CREATE, READ, UPDATE, DELETE
 Error Codes: ERR.OPERATOR_SERVICE_LIST.*
 """
 
 from __future__ import annotations
 from datetime import datetime, timezone
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict, Any
 from pymongo.collection import Collection
 from pymongo import ASCENDING, DESCENDING
 from pymongo.errors import PyMongoError
@@ -19,6 +20,7 @@ from models.operator_service_list_models import (
     OperatorServiceListCreateSchema,
     OperatorServiceListUpdateSchema,
     OperatorServiceListSearchSchema,
+    FormatSchema,
 )
 from utils.validators import PyObjectId
 
@@ -32,12 +34,12 @@ class OperatorServiceListError(Exception):
         super().__init__(self.message)
 
 
-class DuplicateOperatorFormatError(OperatorServiceListError):
-    """Raised when attempting to create duplicate operator format mapping."""
-    def __init__(self, service_id: str, operator_id: str):
+class DuplicateOperatorMappingError(OperatorServiceListError):
+    """Raised when attempting to create duplicate operator mapping."""
+    def __init__(self, operator_id: str):
         super().__init__(
-            f"Operator format mapping already exists for service '{service_id}' and operator '{operator_id}'",
-            "ERR.OPERATOR_SERVICE_LIST.CREATE.DUPLICATE_OPERATOR_FORMAT"
+            f"Operator mapping already exists for operator '{operator_id}'",
+            "ERR.OPERATOR_SERVICE_LIST.CREATE.DUPLICATE_OPERATOR"
         )
 
 
@@ -68,6 +70,16 @@ class InvalidOperatorIdError(OperatorServiceListError):
         )
 
 
+class NoFormatAvailableError(OperatorServiceListError):
+    """Raised when neither global nor service-specific format is available."""
+    def __init__(self, operator_id: str, service_id: str):
+        super().__init__(
+            f"No format available for operator '{operator_id}' and service '{service_id}'. "
+            "Must have either globalFormat or serviceSpecificFormat.",
+            "ERR.OPERATOR_SERVICE_LIST.NO_FORMAT_AVAILABLE"
+        )
+
+
 class DatabaseOperationError(OperatorServiceListError):
     """Raised when database operation fails."""
     def __init__(self, operation: str, details: str):
@@ -80,7 +92,7 @@ class DatabaseOperationError(OperatorServiceListError):
 # ========== Service Class ==========
 class OperatorServiceListService:
     """
-    Service class for Operator Service List operations.
+    Service class for Operator Service List operations (Operator-Centric).
     Implements TFS functions: CREATE, READ, UPDATE, DELETE
     """
     
@@ -95,46 +107,59 @@ class OperatorServiceListService:
             raise DatabaseOperationError("INIT", str(e))
     
     # ========== VALIDATION HELPERS ==========
-    def _validate_service_exists(self, service_id: PyObjectId) -> None:
+    def _validate_operator_exists(self, operator_id: PyObjectId) -> dict:
         """
-        Validate that service ID exists in service_master.
+        Validate that operator ID exists in operators_list.
         
-        TFS Precondition: serviceId exists in service_master
+        TFS Precondition: operatorId exists in operators_list
         
+        Returns:
+            dict: Operator document
+            
         Raises:
-            InvalidServiceIdError: If service not found
+            InvalidOperatorIdError: If operator not found
         """
         try:
-            exists = self.service_master_collection.find_one({
-                "_id": service_id,
+            operator = self.operators_collection.find_one({
+                "_id": operator_id,
                 "isDeleted": False
             })
             
-            if not exists:
-                raise InvalidServiceIdError(str(service_id))
+            if not operator:
+                raise InvalidOperatorIdError(str(operator_id))
+            
+            return operator
         except PyMongoError as e:
-            raise DatabaseOperationError("VALIDATE_SERVICE", str(e))
+            raise DatabaseOperationError("VALIDATE_OPERATOR", str(e))
     
-    def _validate_operators_exist(self, operator_ids: List[PyObjectId]) -> None:
+    def _validate_services_exist(self, service_ids: List[PyObjectId]) -> Dict[str, dict]:
         """
-        Validate that all operator IDs exist in operators_list.
+        Validate that all service IDs exist in service_master.
         
-        TFS Precondition: all operatorIds exist in operators_list
+        TFS Precondition: all serviceIds exist in service_master
         
+        Returns:
+            Dict[str, dict]: Map of service_id -> service document
+            
         Raises:
-            InvalidOperatorIdError: If any operator not found
+            InvalidServiceIdError: If any service not found
         """
         try:
-            for operator_id in operator_ids:
-                exists = self.operators_collection.find_one({
-                    "_id": operator_id,
+            services_map = {}
+            for service_id in service_ids:
+                service = self.service_master_collection.find_one({
+                    "_id": service_id,
                     "isDeleted": False
                 })
                 
-                if not exists:
-                    raise InvalidOperatorIdError(str(operator_id))
+                if not service:
+                    raise InvalidServiceIdError(str(service_id))
+                
+                services_map[str(service_id)] = service
+            
+            return services_map
         except PyMongoError as e:
-            raise DatabaseOperationError("VALIDATE_OPERATORS", str(e))
+            raise DatabaseOperationError("VALIDATE_SERVICES", str(e))
     
     # ========== CREATE Operation (TFS: OperatorServiceList.CREATE) ==========
     def create_operator_service(
@@ -144,19 +169,21 @@ class OperatorServiceListService:
         created_ip: str
     ) -> dict:
         """
-        Create a new operator service mapping record.
+        Create a new operator service mapping record (operator-centric).
         
         TFS Reference: OperatorServiceList.CREATE
         Error Codes:
-            - ERR.OPERATOR_SERVICE_LIST.INVALID_SERVICE_ID
             - ERR.OPERATOR_SERVICE_LIST.INVALID_OPERATOR_ID
-            - ERR.OPERATOR_SERVICE_LIST.CREATE.DUPLICATE_OPERATOR_FORMAT
+            - ERR.OPERATOR_SERVICE_LIST.INVALID_SERVICE_ID
+            - ERR.OPERATOR_SERVICE_LIST.CREATE.DUPLICATE_OPERATOR
+            - ERR.OPERATOR_SERVICE_LIST.NO_FORMAT_AVAILABLE
             - ERR.OPERATOR_SERVICE_LIST.CREATE.DB_ERROR
         
         Preconditions:
-            - serviceId exists in service_master
-            - all operatorIds exist in operators_list
-            - no duplicate operatorFormats per serviceId
+            - operatorId exists in operators_list
+            - all serviceIds exist in service_master
+            - no duplicate operator mapping
+            - each service has format (global or specific)
         
         Args:
             data: Operator service creation data
@@ -167,34 +194,36 @@ class OperatorServiceListService:
             dict: Created operator service document
             
         Raises:
-            InvalidServiceIdError: If service ID not found
-            InvalidOperatorIdError: If any operator ID not found
-            DuplicateOperatorFormatError: If mapping already exists
+            InvalidOperatorIdError: If operator ID not found
+            InvalidServiceIdError: If any service ID not found
+            DuplicateOperatorMappingError: If operator mapping already exists
+            NoFormatAvailableError: If no format available for a service
             DatabaseOperationError: If database operation fails
         """
         try:
-            # ========== VALIDATION: Check if service exists ==========
-            # TFS Precondition: serviceId exists in service_master
-            self._validate_service_exists(data.serviceId)
+            # ========== VALIDATION: Check if operator exists ==========
+            operator = self._validate_operator_exists(data.operatorId)
             
-            # ========== VALIDATION: Check if all operators exist ==========
-            # TFS Precondition: all operatorIds exist in operators_list
-            operator_ids = [fmt.operatorId for fmt in data.operatorFormats]
-            self._validate_operators_exist(operator_ids)
+            # ========== VALIDATION: Check if operator mapping already exists ==========
+            existing = self.collection.find_one({
+                "operatorId": data.operatorId,
+                "isDeleted": False
+            })
             
-            # ========== VALIDATION: Check for duplicate operator formats ==========
-            # TFS Precondition: no duplicate operatorFormats per serviceId
-            for operator_id in operator_ids:
-                existing = self.collection.find_one({
-                    "serviceId": data.serviceId,
-                    "operatorFormats.operatorId": operator_id,
-                    "isDeleted": False
-                })
-                
-                if existing:
-                    # ERROR: Duplicate operator format mapping
-                    # Log: LOG.OPERATOR_SERVICE_LIST.CREATE.END.ERROR.DUPLICATE
-                    raise DuplicateOperatorFormatError(str(data.serviceId), str(operator_id))
+            if existing:
+                # ERROR: Operator mapping already exists
+                # Log: LOG.OPERATOR_SERVICE_LIST.CREATE.END.ERROR.DUPLICATE
+                raise DuplicateOperatorMappingError(str(data.operatorId))
+            
+            # ========== VALIDATION: Check if all services exist ==========
+            service_ids = [svc.serviceId for svc in data.services]
+            services_map = self._validate_services_exist(service_ids)
+            
+            # ========== VALIDATION: Ensure format availability ==========
+            for service_config in data.services:
+                if not service_config.serviceSpecificFormat and not data.globalFormat:
+                    # ERROR: No format available
+                    raise NoFormatAvailableError(str(data.operatorId), str(service_config.serviceId))
             
             # ========== PREPARE DOCUMENT ==========
             now = datetime.now(timezone.utc)
@@ -202,17 +231,16 @@ class OperatorServiceListService:
             # Convert Pydantic models to dict
             operator_service_dict = data.model_dump()
             
-            # Convert nested Pydantic models to dicts
-            operator_service_dict["operatorFormats"] = [
-                {
-                    "operatorId": fmt.operatorId,
-                    "formatFilePath": fmt.formatFilePath,
-                    "listOfAttachments": [
-                        att.model_dump() for att in fmt.listOfAttachments
-                    ]
-                }
-                for fmt in data.operatorFormats
-            ]
+            # Add denormalized operator name if not provided
+            if not operator_service_dict.get("operatorName"):
+                operator_service_dict["operatorName"] = operator.get("operatorName")
+            
+            # Add denormalized service names if not provided
+            for i, service_config in enumerate(operator_service_dict["services"]):
+                if not service_config.get("serviceName"):
+                    service_doc = services_map.get(str(service_config["serviceId"]))
+                    if service_doc:
+                        operator_service_dict["services"][i]["serviceName"] = service_doc.get("serviceName")
             
             document = {
                 **operator_service_dict,
@@ -241,7 +269,7 @@ class OperatorServiceListService:
             
             # NOTIFICATION: In-App and Email notification required
             # Channels: In-App, Email
-            # Template Tokens: {{serviceId}}, {{operatorFormats}}
+            # Template Tokens: {{operatorId}}, {{operatorName}}, {{services}}
             # TODO: Implement notification service
             # self._notify_operator_service_created(document, created_by)
             
@@ -293,57 +321,173 @@ class OperatorServiceListService:
             # ERROR: Unexpected error during read operation
             raise DatabaseOperationError("READ", f"Unexpected error: {str(e)}")
     
-    # ========== GET BY SERVICE ID ==========
-    def get_by_service_id(self, service_id: PyObjectId) -> List[dict]:
+    # ========== GET BY OPERATOR ID (Primary Lookup) ==========
+    def get_by_operator_id(self, operator_id: PyObjectId) -> Optional[dict]:
         """
-        Get all operator service mappings for a specific service.
+        Get operator service mapping for a specific operator.
+        
+        PRIMARY LOOKUP METHOD (operator-centric design).
         
         Args:
-            service_id: Service ID to filter by
+            operator_id: Operator ID to query
             
         Returns:
-            List[dict]: List of operator service mappings
+            dict: Operator service mapping or None if not found
             
         Raises:
             DatabaseOperationError: If database operation fails
         """
         try:
-            results = list(self.collection.find({
-                "serviceId": service_id,
+            result = self.collection.find_one({
+                "operatorId": operator_id,
                 "isDeleted": False
-            }).sort("createdAt", DESCENDING))
+            })
             
-            return results
-        except PyMongoError as e:
-            raise DatabaseOperationError("GET_BY_SERVICE", str(e))
-        except Exception as e:
-            raise DatabaseOperationError("GET_BY_SERVICE", f"Unexpected error: {str(e)}")
-    
-    # ========== GET BY OPERATOR ID ==========
-    def get_by_operator_id(self, operator_id: PyObjectId) -> List[dict]:
-        """
-        Get all operator service mappings for a specific operator.
-        
-        Args:
-            operator_id: Operator ID to filter by
-            
-        Returns:
-            List[dict]: List of operator service mappings
-            
-        Raises:
-            DatabaseOperationError: If database operation fails
-        """
-        try:
-            results = list(self.collection.find({
-                "operatorFormats.operatorId": operator_id,
-                "isDeleted": False
-            }).sort("createdAt", DESCENDING))
-            
-            return results
+            return result
         except PyMongoError as e:
             raise DatabaseOperationError("GET_BY_OPERATOR", str(e))
         except Exception as e:
             raise DatabaseOperationError("GET_BY_OPERATOR", f"Unexpected error: {str(e)}")
+    
+    # ========== GET FORMAT FOR SERVICE (Format Resolution) ==========
+    def get_format_for_service(
+        self,
+        operator_id: PyObjectId,
+        service_id: PyObjectId
+    ) -> Dict[str, Any]:
+        """
+        Get the resolved format configuration for a specific operator-service combination.
+        
+        Resolution Logic:
+        1. Find operator config
+        2. Find service in services[]
+        3. If serviceSpecificFormat exists, return it
+        4. Else return globalFormat
+        
+        Args:
+            operator_id: Operator ID
+            service_id: Service ID
+            
+        Returns:
+            dict: Resolved format with metadata
+                {
+                    "operatorId": ObjectId,
+                    "operatorName": str,
+                    "serviceId": ObjectId,
+                    "serviceName": str,
+                    "formatSource": "global" | "service-specific",
+                    "format": FormatSchema,
+                    "requiredData": dict,
+                    "maxDateRange": int,
+                    "turnaroundTime": int
+                }
+            
+        Raises:
+            OperatorServiceNotFoundError: If operator mapping not found
+            InvalidServiceIdError: If service not found in operator's services
+            NoFormatAvailableError: If no format available
+            DatabaseOperationError: If database operation fails
+        """
+        try:
+            # Get operator config
+            operator_config = self.get_by_operator_id(operator_id)
+            
+            if not operator_config:
+                raise OperatorServiceNotFoundError(f"No mapping found for operator {operator_id}")
+            
+            # Find service in services array
+            service_config = None
+            for svc in operator_config.get("services", []):
+                if svc.get("serviceId") == service_id:
+                    service_config = svc
+                    break
+            
+            if not service_config:
+                raise InvalidServiceIdError(f"Service {service_id} not configured for operator {operator_id}")
+            
+            # Resolve format
+            if service_config.get("serviceSpecificFormat"):
+                format_data = service_config["serviceSpecificFormat"]
+                format_source = "service-specific"
+            elif operator_config.get("globalFormat"):
+                format_data = operator_config["globalFormat"]
+                format_source = "global"
+            else:
+                raise NoFormatAvailableError(str(operator_id), str(service_id))
+            
+            # Build response
+            return {
+                "operatorId": operator_config["operatorId"],
+                "operatorName": operator_config.get("operatorName", ""),
+                "serviceId": service_config["serviceId"],
+                "serviceName": service_config.get("serviceName", ""),
+                "formatSource": format_source,
+                "format": format_data,
+                "requiredData": service_config.get("requiredData", {}),
+                "maxDateRange": service_config.get("maxDateRange"),
+                "turnaroundTime": service_config.get("turnaroundTime")
+            }
+            
+        except OperatorServiceListError:
+            raise
+        except PyMongoError as e:
+            raise DatabaseOperationError("GET_FORMAT", str(e))
+        except Exception as e:
+            raise DatabaseOperationError("GET_FORMAT", f"Unexpected error: {str(e)}")
+    
+    # ========== GET SERVICES BY OPERATOR ==========
+    def get_services_by_operator(self, operator_id: PyObjectId) -> List[dict]:
+        """
+        Get list of services provided by an operator.
+        
+        Args:
+            operator_id: Operator ID
+            
+        Returns:
+            List[dict]: List of service configurations
+            
+        Raises:
+            DatabaseOperationError: If database operation fails
+        """
+        try:
+            operator_config = self.get_by_operator_id(operator_id)
+            
+            if not operator_config:
+                return []
+            
+            return operator_config.get("services", [])
+            
+        except PyMongoError as e:
+            raise DatabaseOperationError("GET_SERVICES", str(e))
+        except Exception as e:
+            raise DatabaseOperationError("GET_SERVICES", f"Unexpected error: {str(e)}")
+    
+    # ========== GET OPERATORS FOR SERVICE ==========
+    def get_operators_for_service(self, service_id: PyObjectId) -> List[dict]:
+        """
+        Get all operators that provide a specific service.
+        
+        Args:
+            service_id: Service ID
+            
+        Returns:
+            List[dict]: List of operator configs that include this service
+            
+        Raises:
+            DatabaseOperationError: If database operation fails
+        """
+        try:
+            results = list(self.collection.find({
+                "services.serviceId": service_id,
+                "services.isActive": True,
+                "isDeleted": False
+            }))
+            
+            return results
+        except PyMongoError as e:
+            raise DatabaseOperationError("GET_OPERATORS_FOR_SERVICE", str(e))
+        except Exception as e:
+            raise DatabaseOperationError("GET_OPERATORS_FOR_SERVICE", f"Unexpected error: {str(e)}")
     
     # ========== UPDATE Operation (TFS: OperatorServiceList.UPDATE) ==========
     def update_operator_service(
@@ -359,7 +503,7 @@ class OperatorServiceListService:
         TFS Reference: OperatorServiceList.UPDATE
         Error Codes:
             - ERR.OPERATOR_SERVICE_LIST.NOT_FOUND
-            - ERR.OPERATOR_SERVICE_LIST.INVALID_OPERATOR_ID
+            - ERR.OPERATOR_SERVICE_LIST.INVALID_SERVICE_ID
             - ERR.OPERATOR_SERVICE_LIST.UPDATE.DB_ERROR
         
         Preconditions:
@@ -376,7 +520,7 @@ class OperatorServiceListService:
             
         Raises:
             OperatorServiceNotFoundError: If record not found or deleted
-            InvalidOperatorIdError: If any operator ID not found
+            InvalidServiceIdError: If any service ID not found
             DatabaseOperationError: If database operation fails
         """
         try:
@@ -394,22 +538,10 @@ class OperatorServiceListService:
             # ========== PREPARE UPDATE DATA ==========
             update_dict = data.model_dump(exclude_unset=True)
             
-            # ========== VALIDATION: Validate operator IDs if being updated ==========
-            if "operatorFormats" in update_dict and update_dict["operatorFormats"] is not None:
-                operator_ids = [fmt.operatorId for fmt in data.operatorFormats]
-                self._validate_operators_exist(operator_ids)
-                
-                # Convert nested Pydantic models to dicts
-                update_dict["operatorFormats"] = [
-                    {
-                        "operatorId": fmt.operatorId,
-                        "formatFilePath": fmt.formatFilePath,
-                        "listOfAttachments": [
-                            att.model_dump() for att in fmt.listOfAttachments
-                        ]
-                    }
-                    for fmt in data.operatorFormats
-                ]
+            # ========== VALIDATION: Validate service IDs if being updated ==========
+            if "services" in update_dict and update_dict["services"] is not None:
+                service_ids = [svc.serviceId for svc in data.services]
+                self._validate_services_exist(service_ids)
             
             # ========== ADD AUDIT FIELDS ==========
             update_dict["updatedAt"] = datetime.now(timezone.utc)
@@ -441,7 +573,7 @@ class OperatorServiceListService:
             # self._log_event("UPDATE", "SUCCESS", record_id, updated_by)
             
             # NOTIFICATION: In-App notification required
-            # Template Tokens: {{_id}}, {{operatorFormats}}
+            # Template Tokens: {{_id}}, {{operatorName}}, {{services}}
             # TODO: Implement notification service
             # self._notify_operator_service_updated(updated_document, updated_by)
             
@@ -544,7 +676,7 @@ class OperatorServiceListService:
         Search and filter operator service mappings with pagination.
         
         TFS Reference: OperatorServiceList.READ (extended)
-        Supports: filtering by serviceId/operatorId, sorting, pagination
+        Supports: filtering by operatorId/serviceId/operatorName, sorting, pagination
         
         Args:
             search_params: Search and filter criteria
@@ -563,13 +695,20 @@ class OperatorServiceListService:
             if not search_params.includeDeleted:
                 query["isDeleted"] = False
             
-            # Service ID filter
-            if search_params.serviceId:
-                query["serviceId"] = search_params.serviceId
-            
-            # Operator ID filter (within operatorFormats array)
+            # Operator ID filter (PRIMARY)
             if search_params.operatorId:
-                query["operatorFormats.operatorId"] = search_params.operatorId
+                query["operatorId"] = search_params.operatorId
+            
+            # Service ID filter (within services array)
+            if search_params.serviceId:
+                query["services.serviceId"] = search_params.serviceId
+            
+            # Operator name filter (partial match)
+            if search_params.operatorName:
+                query["operatorName"] = {
+                    "$regex": search_params.operatorName,
+                    "$options": "i"  # case-insensitive
+                }
             
             # ========== GET TOTAL COUNT ==========
             try:
@@ -624,7 +763,7 @@ class OperatorServiceListService:
         """
         try:
             query = {} if include_deleted else {"isDeleted": False}
-            return list(self.collection.find(query).sort("createdAt", DESCENDING))
+            return list(self.collection.find(query).sort("operatorName", ASCENDING))
         except PyMongoError as e:
             # ERROR: Get all operation failed
             raise DatabaseOperationError("GET_ALL", str(e))
@@ -654,7 +793,7 @@ class OperatorServiceListService:
         Send notification when operator service mapping is created.
         
         Notification Type: In-App, Email
-        Template Tokens: {{serviceId}}, {{operatorFormats}}
+        Template Tokens: {{operatorId}}, {{operatorName}}, {{services}}
         TODO: Implement notification service
         """
         pass
@@ -664,7 +803,7 @@ class OperatorServiceListService:
         Send notification when operator service mapping is updated.
         
         Notification Type: In-App
-        Template Tokens: {{_id}}, {{operatorFormats}}
+        Template Tokens: {{_id}}, {{operatorName}}, {{services}}
         TODO: Implement notification service
         """
         pass
