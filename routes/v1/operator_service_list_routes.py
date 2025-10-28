@@ -2,6 +2,7 @@
 Purpose: FastAPI router for Operator Service List endpoints.
 Provides RESTful API for CRUD operations on operator-service mappings.
 
+UPDATED: Operator-centric design with new exception names and endpoints.
 Based on TFS: OperatorServiceList.CREATE, READ, UPDATE, DELETE
 """
 
@@ -15,18 +16,19 @@ from models.operator_service_list_models import (
     OperatorServiceListResponseSchema,
     OperatorServiceListListResponseSchema,
     OperatorServiceListSearchSchema,
+    ServiceFormatResponseSchema,
 )
 from services.operator_service_list_service import (
     OperatorServiceListService,
-    DuplicateOperatorFormatError,
+    DuplicateOperatorMappingError,  # UPDATED: Was DuplicateOperatorFormatError
     OperatorServiceNotFoundError,
     InvalidServiceIdError,
     InvalidOperatorIdError,
+    NoFormatAvailableError,  # NEW
     DatabaseOperationError,
     OperatorServiceListError,
 )
 from utils.validators import PyObjectId
-
 
 router = APIRouter(
     prefix="/api/v1/operator-services",
@@ -80,15 +82,16 @@ async def create_operator_service(
     request: Request
 ):
     """
-    Create a new operator service mapping.
+    Create a new operator service mapping (operator-centric).
     
     TFS Reference: OperatorServiceList.CREATE
     RBAC Permission: PERM.OPERATOR_SERVICE_LIST.CREATE.GLOBAL
     
     Preconditions:
-        - serviceId exists in service_master
-        - all operatorIds exist in operators_list
-        - no duplicate operatorFormats per serviceId
+        - operatorId exists in operators_list
+        - all serviceIds exist in service_master
+        - no duplicate operator mapping
+        - format available for each service (global or specific)
     
     Raises:
         400: Validation error or duplicate mapping
@@ -105,16 +108,6 @@ async def create_operator_service(
         result = service.create_operator_service(data, created_by, created_ip)
         return result
         
-    except InvalidServiceIdError as e:
-        # ERROR: ERR.OPERATOR_SERVICE_LIST.INVALID_SERVICE_ID
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": e.error_code,
-                "message": e.message,
-                "field": "serviceId"
-            }
-        )
     except InvalidOperatorIdError as e:
         # ERROR: ERR.OPERATOR_SERVICE_LIST.INVALID_OPERATOR_ID
         raise HTTPException(
@@ -122,11 +115,30 @@ async def create_operator_service(
             detail={
                 "error": e.error_code,
                 "message": e.message,
-                "field": "operatorFormats.operatorId"
+                "field": "operatorId"
             }
         )
-    except DuplicateOperatorFormatError as e:
-        # ERROR: ERR.OPERATOR_SERVICE_LIST.CREATE.DUPLICATE_OPERATOR_FORMAT
+    except InvalidServiceIdError as e:
+        # ERROR: ERR.OPERATOR_SERVICE_LIST.INVALID_SERVICE_ID
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": e.error_code,
+                "message": e.message,
+                "field": "services.serviceId"
+            }
+        )
+    except DuplicateOperatorMappingError as e:
+        # ERROR: ERR.OPERATOR_SERVICE_LIST.CREATE.DUPLICATE_OPERATOR
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": e.error_code,
+                "message": e.message
+            }
+        )
+    except NoFormatAvailableError as e:
+        # ERROR: ERR.OPERATOR_SERVICE_LIST.NO_FORMAT_AVAILABLE
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
@@ -145,7 +157,6 @@ async def create_operator_service(
         )
     except DatabaseOperationError as e:
         # ERROR: ERR.OPERATOR_SERVICE_LIST.CREATE.DB_ERROR
-        # Log full traceback for debugging
         print(f"Database error in create_operator_service: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -232,76 +243,48 @@ async def get_operator_service(
         )
 
 
-# ========== GET BY SERVICE ID Endpoint ==========
-@router.get(
-    "/service/{service_id}",
-    response_model=list[OperatorServiceListResponseSchema],
-    summary="Get Operator Service Mappings by Service ID",
-    description="Get all operator service mappings for a specific service"
-)
-async def get_by_service_id(
-    service_id: PyObjectId = Path(..., description="Service ID")
-):
-    """
-    Get all operator service mappings for a specific service.
-    
-    RBAC Permission: PERM.OPERATOR_SERVICE_LIST.READ.GLOBAL
-    """
-    try:
-        # TODO: Check RBAC permission: PERM.OPERATOR_SERVICE_LIST.READ.GLOBAL
-        
-        results = service.get_by_service_id(service_id)
-        return results
-        
-    except DatabaseOperationError as e:
-        # ERROR: Database operation failed
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error": e.error_code,
-                "message": "Failed to retrieve operator service mappings"
-            }
-        )
-    except Exception as e:
-        # ERROR: Unexpected error
-        print(f"Unexpected error in get_by_service_id: {traceback.format_exc()}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error": "ERR.OPERATOR_SERVICE_LIST.GET_BY_SERVICE.UNEXPECTED",
-                "message": "An unexpected error occurred"
-            }
-        )
-
-
-# ========== GET BY OPERATOR ID Endpoint ==========
+# ========== GET BY OPERATOR ID (PRIMARY LOOKUP) ==========
 @router.get(
     "/operator/{operator_id}",
-    response_model=list[OperatorServiceListResponseSchema],
-    summary="Get Operator Service Mappings by Operator ID",
-    description="Get all operator service mappings for a specific operator"
+    response_model=OperatorServiceListResponseSchema,
+    summary="Get Operator Service Mapping by Operator ID",
+    description="Get operator service mapping for a specific operator (PRIMARY LOOKUP)"
 )
 async def get_by_operator_id(
     operator_id: PyObjectId = Path(..., description="Operator ID")
 ):
     """
-    Get all operator service mappings for a specific operator.
+    Get operator service mapping for a specific operator.
+    
+    PRIMARY LOOKUP METHOD (operator-centric design).
     
     RBAC Permission: PERM.OPERATOR_SERVICE_LIST.READ.GLOBAL
     """
     try:
         # TODO: Check RBAC permission: PERM.OPERATOR_SERVICE_LIST.READ.GLOBAL
         
-        results = service.get_by_operator_id(operator_id)
-        return results
+        result = service.get_by_operator_id(operator_id)
         
+        if not result:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": "ERR.OPERATOR_SERVICE_LIST.NOT_FOUND",
+                    "message": f"No service mapping found for operator {operator_id}"
+                }
+            )
+        
+        return result
+        
+    except HTTPException:
+        raise
     except DatabaseOperationError as e:
         # ERROR: Database operation failed
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
                 "error": e.error_code,
-                "message": "Failed to retrieve operator service mappings"
+                "message": "Failed to retrieve operator service mapping"
             }
         )
     except Exception as e:
@@ -311,6 +294,119 @@ async def get_by_operator_id(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail={
                 "error": "ERR.OPERATOR_SERVICE_LIST.GET_BY_OPERATOR.UNEXPECTED",
+                "message": "An unexpected error occurred"
+            }
+        )
+
+
+# ========== GET FORMAT FOR SERVICE (NEW ENDPOINT) ==========
+@router.get(
+    "/operator/{operator_id}/service/{service_id}/format",
+    response_model=ServiceFormatResponseSchema,
+    summary="Get Format Configuration for Service",
+    description="Get resolved format configuration for a specific operator-service combination"
+)
+async def get_format_for_service(
+    operator_id: PyObjectId = Path(..., description="Operator ID"),
+    service_id: PyObjectId = Path(..., description="Service ID")
+):
+    """
+    Get the resolved format configuration for a specific operator-service combination.
+    
+    Resolution Logic:
+    1. Find operator config
+    2. Find service in services[]
+    3. If serviceSpecificFormat exists, return it
+    4. Else return globalFormat
+    
+    RBAC Permission: PERM.OPERATOR_SERVICE_LIST.READ.GLOBAL
+    """
+    try:
+        # TODO: Check RBAC permission: PERM.OPERATOR_SERVICE_LIST.READ.GLOBAL
+        
+        result = service.get_format_for_service(operator_id, service_id)
+        return result
+        
+    except OperatorServiceNotFoundError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": e.error_code,
+                "message": e.message
+            }
+        )
+    except InvalidServiceIdError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": e.error_code,
+                "message": e.message
+            }
+        )
+    except NoFormatAvailableError as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": e.error_code,
+                "message": e.message
+            }
+        )
+    except DatabaseOperationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": e.error_code,
+                "message": "Failed to retrieve format configuration"
+            }
+        )
+    except Exception as e:
+        print(f"Unexpected error in get_format_for_service: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "ERR.OPERATOR_SERVICE_LIST.GET_FORMAT.UNEXPECTED",
+                "message": "An unexpected error occurred"
+            }
+        )
+
+
+# ========== GET OPERATORS FOR SERVICE ==========
+@router.get(
+    "/service/{service_id}/operators",
+    response_model=list[OperatorServiceListResponseSchema],
+    summary="Get Operators Providing a Service",
+    description="Get all operators that provide a specific service"
+)
+async def get_operators_for_service(
+    service_id: PyObjectId = Path(..., description="Service ID")
+):
+    """
+    Get all operators that provide a specific service.
+    
+    RBAC Permission: PERM.OPERATOR_SERVICE_LIST.READ.GLOBAL
+    """
+    try:
+        # TODO: Check RBAC permission: PERM.OPERATOR_SERVICE_LIST.READ.GLOBAL
+        
+        results = service.get_operators_for_service(service_id)
+        return results
+        
+    except DatabaseOperationError as e:
+        # ERROR: Database operation failed
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": e.error_code,
+                "message": "Failed to retrieve operators"
+            }
+        )
+    except Exception as e:
+        # ERROR: Unexpected error
+        print(f"Unexpected error in get_operators_for_service: {traceback.format_exc()}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail={
+                "error": "ERR.OPERATOR_SERVICE_LIST.GET_OPERATORS.UNEXPECTED",
                 "message": "An unexpected error occurred"
             }
         )
@@ -374,14 +470,14 @@ async def update_operator_service(
                 "message": e.message
             }
         )
-    except InvalidOperatorIdError as e:
-        # ERROR: ERR.OPERATOR_SERVICE_LIST.INVALID_OPERATOR_ID
+    except InvalidServiceIdError as e:
+        # ERROR: ERR.OPERATOR_SERVICE_LIST.INVALID_SERVICE_ID
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "error": e.error_code,
                 "message": e.message,
-                "field": "operatorFormats.operatorId"
+                "field": "services.serviceId"
             }
         )
     except ValueError as e:
@@ -500,8 +596,9 @@ async def delete_operator_service(
     description="Search, filter, sort, and paginate operator service mappings (Extended TFS: OperatorServiceList.READ)"
 )
 async def search_operator_services(
-    service_id: Optional[PyObjectId] = Query(None, description="Filter by service ID", alias="serviceId"),
     operator_id: Optional[PyObjectId] = Query(None, description="Filter by operator ID", alias="operatorId"),
+    service_id: Optional[PyObjectId] = Query(None, description="Filter by service ID (within services array)", alias="serviceId"),
+    operator_name: Optional[str] = Query(None, description="Filter by operator name (partial match)", alias="operatorName"),
     include_deleted: bool = Query(False, description="Include soft-deleted records", alias="includeDeleted"),
     sort_by: str = Query("createdAt", description="Field to sort by", alias="sortBy"),
     sort_order: str = Query("desc", description="Sort order (asc or desc)", alias="sortOrder"),
@@ -518,8 +615,9 @@ async def search_operator_services(
         # TODO: Check RBAC permission: PERM.OPERATOR_SERVICE_LIST.READ.GLOBAL
         
         search_params = OperatorServiceListSearchSchema(
-            serviceId=service_id,
             operatorId=operator_id,
+            serviceId=service_id,
+            operatorName=operator_name,
             includeDeleted=include_deleted,
             sortBy=sort_by,
             sortOrder=sort_order,
