@@ -33,7 +33,7 @@ class LineItemRequestStatus(str, Enum):
     APPROVED_BY_SHO = "ApprovedbySHO"  # Added from your data model
 
 
-class ConsolidatedCrpcRequestStatus(str, Enum):
+class ConsolidatedRequestStatus(str, Enum):
     """Status for consolidated dispatch packets."""
     DOWNLOADED = "Downloaded"
     NOT_DOWNLOADED = "NotDownloaded"
@@ -81,6 +81,23 @@ class RejectReason(str, Enum):
     """Predefined reasons for request rejection."""
     VIP_NUMBER = "VIP Number ....."
     # Add more reasons as needed
+
+# Add to existing constants/value_sets.py
+
+class ProcessingStatus(str, Enum):
+    """Status for data_received processing."""
+    PENDING = "Pending"
+    AUTO_MATCHED = "AutoMatched"
+    HAS_CONFLICTS = "HasConflicts"
+    COMPLETED = "Completed"
+
+
+class MatchingStatus(str, Enum):
+    """Status for individual file matching."""
+    AUTO_MATCHED = "AutoMatched"
+    CONFLICT = "Conflict"
+    UNMATCHED = "Unmatched"
+    MANUALLY_MAPPED = "ManuallyMapped"
 
 
 # ========== Helper Functions ==========
